@@ -1,10 +1,10 @@
 #include <ros/ros.h>
+#include <sensor_msgs/Imu.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <cstring>
 #include <iostream>
-#include <iomanip>
 
 #pragma pack(push, 1)
 struct ImuBlock
@@ -13,9 +13,9 @@ struct ImuBlock
     uint64_t timestamp_sample;
     uint32_t device_id;
     float dt;
-    float scale;
+    float scale; // 动态缩放因子
     uint8_t samples;
-    uint8_t _pad[3];
+    uint8_t _pad[3]; // 对齐补齐字节，确保头部刚好 32 字节
     int16_t x[32];
     int16_t y[32];
     int16_t z[32];
@@ -30,14 +30,15 @@ struct ImuFifoData
 
 int main(int argc, char **argv)
 {
-    ros::init(argc, argv, "imu_raw_inspector");
+    ros::init(argc, argv, "imu_node");
     ros::NodeHandle nh;
+    ros::Publisher imu_pub = nh.advertise<sensor_msgs::Imu>("/drone/imu", 100);
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0)
         return -1;
 
-    // 设置非阻塞，用于排空旧数据
+    // 设置非阻塞，排空旧包，确保最低延迟
     fcntl(sockfd, F_SETFL, O_NONBLOCK);
 
     sockaddr_in servaddr;
@@ -48,19 +49,19 @@ int main(int argc, char **argv)
 
     if (bind(sockfd, (const sockaddr *)&servaddr, sizeof(servaddr)) < 0)
     {
-        ROS_ERROR("Bind failed");
+        ROS_ERROR("Bind failed! Port 7777 is occupied.");
         return -1;
     }
 
     uint8_t buffer[1024];
-    ROS_INFO("Raw Inspector Started. Printing INT16 values.");
+    ROS_INFO("IMU Node Started! Using DYNAMIC scale factors.");
 
     while (ros::ok())
     {
         ssize_t len;
         ssize_t last_len = -1;
 
-        // 【关键】排空旧包，只留最新的一帧
+        // 拿空缓冲区，只留最新一包
         while ((len = recv(sockfd, buffer, sizeof(buffer), 0)) > 0)
         {
             last_len = len;
@@ -70,32 +71,28 @@ int main(int argc, char **argv)
         {
             ImuFifoData *data = (ImuFifoData *)buffer;
 
-            // 清屏打印，方便观察
-            std::cout << "\033[2J\033[1;1H";
-            std::cout << "--- IMU Raw Data Inspector (Index 0) ---" << std::endl;
-            std::cout << "TimeSample: " << data->accel.timestamp_sample << std::endl;
-            std::cout << "Samples   : Acc[" << (int)data->accel.samples << "] Gyro[" << (int)data->gyro.samples << "]" << std::endl;
+            sensor_msgs::Imu msg;
+            msg.header.stamp = ros::Time::now();
+            msg.header.frame_id = "imu_link";
 
-            std::cout << std::fixed << std::setprecision(0);
-            std::cout << "\n[ACCEL RAW]  X: " << std::setw(8) << data->accel.x[0]
-                      << "  Y: " << std::setw(8) << data->accel.y[0]
-                      << "  Z: " << std::setw(8) << data->accel.z[0] << std::endl;
+            // 核心修复：原始数据直接乘上各自数据块自带的 Scale
+            msg.linear_acceleration.x = data->accel.x[0] * data->accel.scale;
+            msg.linear_acceleration.y = data->accel.y[0] * data->accel.scale;
+            msg.linear_acceleration.z = data->accel.z[0] * data->accel.scale;
 
-            std::cout << "[GYRO  RAW]  X: " << std::setw(8) << data->gyro.x[0]
-                      << "  Y: " << std::setw(8) << data->gyro.y[0]
-                      << "  Z: " << std::setw(8) << data->gyro.z[0] << std::endl;
+            msg.angular_velocity.x = data->gyro.x[0] * data->gyro.scale;
+            msg.angular_velocity.y = data->gyro.y[0] * data->gyro.scale;
+            msg.angular_velocity.z = data->gyro.z[0] * data->gyro.scale;
 
-            std::cout << "\n--- Diagnostic ---" << std::endl;
-            // 逻辑判断：静止时，谁的 Z 轴大，谁就是 Accel
-            if (std::abs(data->gyro.z[0]) > std::abs(data->accel.z[0]) + 1000)
-            {
-                std::cout << "!! WARNING: Gyro Z is much larger than Accel Z. Positions might be SWAPPED." << std::endl;
-            }
+            // 如果有需要，可以在这里打印一下当前的 scale，观察 px4 切换模式
+            // ROS_INFO_THROTTLE(1.0, "Accel Scale: %f, Gyro Scale: %f", data->accel.scale, data->gyro.scale);
+
+            imu_pub.publish(msg);
         }
 
-        ros::Duration(0.05).sleep(); // 20Hz 刷新率足够肉眼观察
+        // 匹配 1000Hz 处理速度
+        usleep(1000);
         ros::spinOnce();
     }
-    close(sockfd);
     return 0;
 }
