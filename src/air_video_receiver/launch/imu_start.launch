@@ -1,0 +1,9 @@
+<launch>
+    <arg name="calibrate" default="false" />
+
+    <node pkg="air_video_receiver" type="imu_node" name="imu_node" output="screen">
+        <param name="calibrate" value="$(arg calibrate)" />
+        
+        <rosparam command="load" file="$(find air_video_receiver)/config/imu_calib.yaml" />
+    </node>
+</launch>
