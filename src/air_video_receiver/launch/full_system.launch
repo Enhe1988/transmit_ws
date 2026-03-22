@@ -1,0 +1,17 @@
+<launch>
+    <arg name="record_bag" default="false" />
+
+    <node pkg="air_video_receiver" type="imu_node" name="imu_node" output="screen">
+        <param name="calibrate" value="false" />
+        <rosparam command="load" file="$(find air_video_receiver)/config/imu_calib.yaml" />
+    </node>
+
+    <node pkg="air_video_receiver" type="h265_node" name="h265_node" output="screen" />
+
+    <node pkg="rqt_image_view" type="rqt_image_view" name="rqt_viewer" args="/camera/image_raw" output="log" />
+
+    <node pkg="rosbag" type="record" name="rosbag_record"
+          args="-o $(find air_video_receiver)/bags/flight_data /camera/image_raw /drone/imu"
+          if="$(arg record_bag)" 
+          output="screen" />
+</launch>

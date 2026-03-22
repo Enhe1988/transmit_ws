@@ -1,3 +1,7 @@
 build/
 devel/
 .catkin_workspace
+
+# ROS bag 录制文件
+*.bag
+*.mp4

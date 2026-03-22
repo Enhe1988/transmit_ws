@@ -114,11 +114,11 @@ int main(int argc, char **argv)
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(9002);
+    servaddr.sin_port = htons(7777);
 
     if (bind(sockfd, (const sockaddr *)&servaddr, sizeof(servaddr)) < 0)
     {
-        ROS_ERROR("CRITICAL ERROR: Port 9002 is already in use!");
+        ROS_ERROR("CRITICAL ERROR: Port 7777 is already in use!");
         return -1;
     }
 
@@ -129,7 +129,7 @@ int main(int argc, char **argv)
     static uint64_t base_sky_time_us = 0;
 
     ROS_INFO("============================================");
-    ROS_INFO("IMU Node Started! Monitoring Port 9002...");
+    ROS_INFO("IMU Node Started! Monitoring Port 7777...");
     ROS_INFO("============================================");
 
     ros::Time last_print_time = ros::Time::now();
@@ -148,77 +148,102 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            ImuFifoData *data = (ImuFifoData *)buffer;
+            ImuFifoData* data = (ImuFifoData*)buffer;
 
-            float ax = data->accel.x[0] * data->accel.scale;
-            float ay = data->accel.y[0] * data->accel.scale;
-            float az = data->accel.z[0] * data->accel.scale;
-            float gx = data->gyro.x[0] * data->gyro.scale;
-            float gy = data->gyro.y[0] * data->gyro.scale;
-            float gz = data->gyro.z[0] * data->gyro.scale;
+            // 获取这个包里究竟打包了几个 IMU 采样点 (通常是 3 或 4)
+            uint8_t count = data->accel.samples; 
+            if (count == 0 || count > 32) continue; // 安全防护
 
-            // --- 阶段 A：校准 ---
-            if (!is_calibrated)
-            {
-                sum_gyro_x += gx;
-                sum_gyro_y += gy;
-                sum_gyro_z += gz;
-                calibration_count++;
-                if (calibration_count >= CALIBRATION_SAMPLES)
-                {
-                    bias_gyro_x = sum_gyro_x / CALIBRATION_SAMPLES;
-                    bias_gyro_y = sum_gyro_y / CALIBRATION_SAMPLES;
-                    bias_gyro_z = sum_gyro_z / CALIBRATION_SAMPLES;
-                    is_calibrated = true;
-                    ROS_INFO("Calibration Complete! Bias -> X:%.4f Y:%.4f Z:%.4f", bias_gyro_x, bias_gyro_y, bias_gyro_z);
+            // 获取硬件真实的时间步长 (比如 0.001s)
+            float dt_sec = (data->accel.dt > 0.000001f) ? data->accel.dt : 0.001f; 
+            uint64_t dt_us = (uint64_t)(dt_sec * 1000000.0f); // 转成微秒
+
+            // 核心修复：遍历包内的【每一个】采样点
+            for (int i = 0; i < count; ++i) {
+                // 1. 依次提取数组中的每一个物理值
+                float ax = data->accel.x[i] * data->accel.scale;
+                float ay = data->accel.y[i] * data->accel.scale;
+                float az = data->accel.z[i] * data->accel.scale;
+                float gx = data->gyro.x[i] * data->gyro.scale;
+                float gy = data->gyro.y[i] * data->gyro.scale;
+                float gz = data->gyro.z[i] * data->gyro.scale;
+
+                // --- 阶段 A：静态校准 ---
+                if (!is_calibrated) {
+                    sum_gyro_x += gx; sum_gyro_y += gy; sum_gyro_z += gz;
+                    calibration_count++;
+                    if (calibration_count >= CALIBRATION_SAMPLES) {
+                        bias_gyro_x = sum_gyro_x / CALIBRATION_SAMPLES;
+                        bias_gyro_y = sum_gyro_y / CALIBRATION_SAMPLES;
+                        bias_gyro_z = sum_gyro_z / CALIBRATION_SAMPLES;
+                        is_calibrated = true;
+                        ROS_INFO("Calibration Complete! Bias -> X:%.4f Y:%.4f Z:%.4f", bias_gyro_x, bias_gyro_y, bias_gyro_z);
+                        // --- 补回写文件的代码开始 ---
+                        std::string pkg_path = ros::package::getPath("air_video_receiver");
+                        std::string yaml_path = pkg_path + "/config/imu_calib.yaml";
+                        std::ofstream outfile(yaml_path);
+                        if (outfile.is_open())
+                        {
+                            outfile << "gyro_bias_x: " << bias_gyro_x << "\n";
+                            outfile << "gyro_bias_y: " << bias_gyro_y << "\n";
+                            outfile << "gyro_bias_z: " << bias_gyro_z << "\n";
+                            outfile.close();
+                            ROS_INFO("Successfully saved bias to %s", yaml_path.c_str());
+                        }
+                        else
+                        {
+                            ROS_ERROR("Failed to open %s for writing! Check folder permissions.", yaml_path.c_str());
+                        }
+                        // --- 补回写文件的代码结束 ---
+                    }
+                    continue; 
                 }
-                continue;
+
+                // --- 阶段 B：Mahony 姿态解算 (高频步进) ---
+                gx -= bias_gyro_x; gy -= bias_gyro_y; gz -= bias_gyro_z;
+                // 现在的 dt 是完美匹配单次采样的！不会再有慢动作了！
+                MahonyAHRSupdateIMU(gx, gy, gz, ax, ay, az, dt_sec);
+
+                // --- 阶段 C：精细时间对齐 ---
+                if (!time_initialized) {
+                    base_ros_time = ros::Time::now(); 
+                    base_sky_time_us = data->accel.timestamp_sample; 
+                    time_initialized = true;
+                    ROS_INFO("\n>>> TIME ANCHOR SET! Publishing 1000Hz IMU Data... <<<\n");
+                }
+
+                // 极端严谨：为这个打包数组里的第 i 个数据，计算其独立的绝对时间
+                // 假设 timestamp_sample 是这个包里第一个点 [0] 的时间
+                uint64_t current_sample_time_us = data->accel.timestamp_sample + (i * dt_us);
+
+                if (current_sample_time_us < base_sky_time_us) continue;
+
+                uint64_t elapsed_us = current_sample_time_us - base_sky_time_us;
+                uint32_t elapsed_sec = elapsed_us / 1000000;
+                uint32_t elapsed_nsec = (elapsed_us % 1000000) * 1000; 
+                ros::Duration elapsed_duration(elapsed_sec, elapsed_nsec);
+
+                // --- 阶段 D：发布 ---
+                sensor_msgs::Imu msg;
+                msg.header.stamp = base_ros_time + elapsed_duration;
+                msg.header.frame_id = "imu_link"; 
+                
+                msg.linear_acceleration.x = ax; msg.linear_acceleration.y = ay; msg.linear_acceleration.z = az;
+                msg.angular_velocity.x = gx; msg.angular_velocity.y = gy; msg.angular_velocity.z = gz;
+                
+                msg.orientation.w = q0; msg.orientation.x = q1; msg.orientation.y = q2; msg.orientation.z = q3;
+
+                imu_pub.publish(msg);
+                // 这里加个计数器，用来测试我们一秒钟到底发了多少个数据
+                packets_processed_this_sec++;
+
+                // 临时验证：打印欧拉角，用于定量验证姿态解算准确性
+                float roll  = atan2f(2.0f*(q0*q1+q2*q3), 1.0f-2.0f*(q1*q1+q2*q2));
+                float pitch = asinf(2.0f*(q0*q2-q3*q1));
+                float yaw   = atan2f(2.0f*(q0*q3+q1*q2), 1.0f-2.0f*(q2*q2+q3*q3));
+                ROS_INFO_THROTTLE(0.5, "RPY: %.1f  %.1f  %.1f (deg)",
+                    roll*57.3f, pitch*57.3f, yaw*57.3f);
             }
-
-            // --- 阶段 B：Mahony 姿态解算 ---
-            gx -= bias_gyro_x;
-            gy -= bias_gyro_y;
-            gz -= bias_gyro_z;
-            float dt_sec = (data->accel.dt > 0.000001f) ? data->accel.dt : 0.001f;
-            MahonyAHRSupdateIMU(gx, gy, gz, ax, ay, az, dt_sec);
-
-            // --- 阶段 C：时间对齐 ---
-            if (!time_initialized)
-            {
-                base_ros_time = ros::Time::now();
-                base_sky_time_us = data->accel.timestamp_sample;
-                time_initialized = true;
-                ROS_INFO("\n>>> TIME ANCHOR SET! Publishing IMU Data... <<<\n");
-            }
-
-            // 丢弃明显的乱序包（比如时间跳回了开机前）
-            if (data->accel.timestamp_sample < base_sky_time_us)
-                continue;
-
-            uint64_t elapsed_us = data->accel.timestamp_sample - base_sky_time_us;
-            uint32_t elapsed_sec = elapsed_us / 1000000;
-            uint32_t elapsed_nsec = (elapsed_us % 1000000) * 1000;
-            ros::Duration elapsed_duration(elapsed_sec, elapsed_nsec);
-
-            // --- 阶段 D：发布 ---
-            sensor_msgs::Imu msg;
-            msg.header.stamp = base_ros_time + elapsed_duration;
-            msg.header.frame_id = "imu_link";
-
-            msg.linear_acceleration.x = ax;
-            msg.linear_acceleration.y = ay;
-            msg.linear_acceleration.z = az;
-            msg.angular_velocity.x = gx;
-            msg.angular_velocity.y = gy;
-            msg.angular_velocity.z = gz;
-
-            msg.orientation.w = q0;
-            msg.orientation.x = q1;
-            msg.orientation.y = q2;
-            msg.orientation.z = q3;
-
-            imu_pub.publish(msg);
-            packets_processed_this_sec++;
         }
 
         // --- 心跳监控雷达 ---
