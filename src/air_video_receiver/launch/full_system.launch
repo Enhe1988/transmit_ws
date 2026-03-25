@@ -1,12 +1,15 @@
 <launch>
     <arg name="record_bag" default="false" />
+    <arg name="time_offset_ms" default="0.0" />
 
     <node pkg="air_video_receiver" type="imu_node" name="imu_node" output="screen">
         <param name="calibrate" value="false" />
         <rosparam command="load" file="$(find air_video_receiver)/config/imu_calib.yaml" />
     </node>
 
-    <node pkg="air_video_receiver" type="h265_node" name="h265_node" output="screen" />
+    <node pkg="air_video_receiver" type="h265_node" name="h265_node" output="screen">
+        <param name="time_offset_ms" value="$(arg time_offset_ms)" />
+    </node>
 
     <node pkg="rqt_image_view" type="rqt_image_view" name="rqt_viewer" args="/camera/image_raw" output="log" />
 

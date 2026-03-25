@@ -8,6 +8,12 @@
 #include <gst/app/gstappsink.h>
 
 image_transport::Publisher pub;
+double g_time_offset_sec = 0.0; // 相机时间补偿量（秒），正值表示时间戳往前拨
+
+// --- PTS 时间锚点（与 IMU 锚点机制对称）---
+static bool      time_initialized  = false;
+static ros::Time base_ros_time;
+static GstClockTime base_pts_ns = 0;
 
 GstFlowReturn new_sample(GstAppSink *appsink, gpointer user_data)
 {
@@ -15,7 +21,7 @@ GstFlowReturn new_sample(GstAppSink *appsink, gpointer user_data)
     if (!sample)
         return GST_FLOW_ERROR;
 
-    // --- 核心优化：动态获取底层解码器输出的真实尺寸，防止绿屏和内存崩溃 ---
+    // 动态获取解码器输出的真实尺寸，防止绿屏和内存崩溃
     GstCaps *caps = gst_sample_get_caps(sample);
     GstStructure *structure = gst_caps_get_structure(caps, 0);
     gint width, height;
@@ -23,26 +29,41 @@ GstFlowReturn new_sample(GstAppSink *appsink, gpointer user_data)
     gst_structure_get_int(structure, "height", &height);
 
     GstBuffer *buffer = gst_sample_get_buffer(sample);
-    GstMapInfo map;
 
-    // 锁定内存读取
+    // 获取 GStreamer buffer 的 PTS（纳秒）
+    GstClockTime pts = GST_BUFFER_PTS(buffer);
+
+    GstMapInfo map;
     gst_buffer_map(buffer, &map, GST_MAP_READ);
 
-    // 构建 OpenCV Mat (使用动态获取的宽高)
     cv::Mat frame(height, width, CV_8UC3, (char *)map.data);
 
-    if (!frame.empty())
+    if (!frame.empty() && GST_CLOCK_TIME_IS_VALID(pts))
     {
+        // 建立锚点：第一帧同时记录 ROS 时间和 PTS
+        if (!time_initialized)
+        {
+            base_ros_time     = ros::Time::now();
+            base_pts_ns       = pts;
+            time_initialized  = true;
+            ROS_INFO(">>> CAMERA TIME ANCHOR SET! PTS-based timestamps active. <<<");
+        }
+
+        // 用 PTS 偏移量推算 ROS 时间戳，消除回调调度抖动
+        GstClockTime elapsed_ns = pts - base_pts_ns;
+        uint32_t elapsed_sec  = elapsed_ns / 1000000000ULL;
+        uint32_t elapsed_nsec = elapsed_ns % 1000000000ULL;
+        ros::Time stamp = base_ros_time + ros::Duration(elapsed_sec, elapsed_nsec)
+                          - ros::Duration(g_time_offset_sec);
+
         std_msgs::Header header;
-        // ⚠️ TODO: 目前是软同步。等待技术支持回复后，这里要替换为基于 IMU 锚点的硬件同步时间！
-        header.stamp = ros::Time::now();
+        header.stamp    = stamp;
         header.frame_id = "camera_link";
 
         sensor_msgs::ImagePtr msg = cv_bridge::CvImage(header, "bgr8", frame).toImageMsg();
         pub.publish(msg);
     }
 
-    // 清理内存
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
 
@@ -53,14 +74,21 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "h265_receiver_node");
     ros::NodeHandle nh;
+    ros::NodeHandle private_nh("~");
     image_transport::ImageTransport it(nh);
+
+    double time_offset_ms = 0.0;
+    private_nh.param("time_offset_ms", time_offset_ms, 0.0);
+    g_time_offset_sec = time_offset_ms / 1000.0;
+    ROS_INFO("Camera time offset: %.1f ms", time_offset_ms);
 
     pub = it.advertise("/camera/image_raw", 1);
 
     gst_init(&argc, &argv);
 
-    // 监听 9002 端口
-    std::string pipeline_str = "udpsrc port=9002 ! h265parse ! avdec_h265 ! videoconvert ! video/x-raw, format=BGR ! appsink name=mysink";
+    std::string pipeline_str =
+        "udpsrc port=9002 ! h265parse ! avdec_h265 ! videoconvert ! "
+        "video/x-raw, format=BGR ! appsink name=mysink";
 
     GError *error = nullptr;
     GstElement *pipeline = gst_parse_launch(pipeline_str.c_str(), &error);

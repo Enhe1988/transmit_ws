@@ -127,6 +127,8 @@ int main(int argc, char **argv)
     static bool time_initialized = false;
     static ros::Time base_ros_time;
     static uint64_t base_sky_time_us = 0;
+    static uint64_t next_target_us = 0;
+    const uint64_t publish_interval_us = 5000; // 200Hz
 
     ROS_INFO("============================================");
     ROS_INFO("IMU Node Started! Monitoring Port 7777...");
@@ -150,8 +152,13 @@ int main(int argc, char **argv)
 
             ImuFifoData* data = (ImuFifoData*)buffer;
 
+            // 仅在加速度 scale 为 0 时打印，精准捕获异常包
+            if (data->accel.scale == 0.0f)
+                ROS_WARN("[DEBUG] accel.scale=0! gyro.scale=%.6f  samples=%d",
+                    data->gyro.scale, data->accel.samples);
+
             // 获取这个包里究竟打包了几个 IMU 采样点 (通常是 3 或 4)
-            uint8_t count = data->accel.samples; 
+            uint8_t count = data->accel.samples;
             if (count == 0 || count > 32) continue; // 安全防护
 
             // 获取硬件真实的时间步长 (比如 0.001s)
@@ -167,6 +174,9 @@ int main(int argc, char **argv)
                 float gx = data->gyro.x[i] * data->gyro.scale;
                 float gy = data->gyro.y[i] * data->gyro.scale;
                 float gz = data->gyro.z[i] * data->gyro.scale;
+
+                // 跳过 accel FIFO 末尾的 0 填充槽位
+                if (ax == 0.0f && ay == 0.0f && az == 0.0f) continue;
 
                 // --- 阶段 A：静态校准 ---
                 if (!is_calibrated) {
@@ -206,10 +216,11 @@ int main(int argc, char **argv)
 
                 // --- 阶段 C：精细时间对齐 ---
                 if (!time_initialized) {
-                    base_ros_time = ros::Time::now(); 
-                    base_sky_time_us = data->accel.timestamp_sample; 
+                    base_ros_time = ros::Time::now();
+                    base_sky_time_us = data->accel.timestamp_sample;
+                    next_target_us = base_sky_time_us;
                     time_initialized = true;
-                    ROS_INFO("\n>>> TIME ANCHOR SET! Publishing 1000Hz IMU Data... <<<\n");
+                    ROS_INFO("\n>>> TIME ANCHOR SET! Publishing IMU Data... <<<\n");
                 }
 
                 // 极端严谨：为这个打包数组里的第 i 个数据，计算其独立的绝对时间
@@ -217,6 +228,10 @@ int main(int argc, char **argv)
                 uint64_t current_sample_time_us = data->accel.timestamp_sample + (i * dt_us);
 
                 if (current_sample_time_us < base_sky_time_us) continue;
+
+                // 固定网格门控：取每个 5ms 时间槽内的第一个样本
+                if (current_sample_time_us < next_target_us) continue;
+                next_target_us += publish_interval_us;
 
                 uint64_t elapsed_us = current_sample_time_us - base_sky_time_us;
                 uint32_t elapsed_sec = elapsed_us / 1000000;

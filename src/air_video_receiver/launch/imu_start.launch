@@ -1,9 +1,14 @@
 <launch>
+    <arg name="record_bag" default="false" />
     <arg name="calibrate" default="false" />
 
     <node pkg="air_video_receiver" type="imu_node" name="imu_node" output="screen">
         <param name="calibrate" value="$(arg calibrate)" />
-        
         <rosparam command="load" file="$(find air_video_receiver)/config/imu_calib.yaml" />
     </node>
+
+    <node pkg="rosbag" type="record" name="rosbag_record"
+          args="-o $(find air_video_receiver)/bags/imu_data /drone/imu"
+          if="$(arg record_bag)"
+          output="screen" />
 </launch>
