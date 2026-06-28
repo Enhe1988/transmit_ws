@@ -2,10 +2,7 @@
     <arg name="record_bag" default="false" />
     <arg name="time_offset_ms" default="0.0" />
 
-    <node pkg="air_video_receiver" type="imu_node" name="imu_node" output="screen">
-        <param name="calibrate" value="false" />
-        <rosparam command="load" file="$(find air_video_receiver)/config/imu_calib.yaml" />
-    </node>
+    <node pkg="air_video_receiver" type="imu_node" name="imu_node" output="screen" />
 
     <node pkg="air_video_receiver" type="h265_node" name="h265_node" output="screen">
         <param name="time_offset_ms" value="$(arg time_offset_ms)" />

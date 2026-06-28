@@ -36,6 +36,10 @@ target_link_libraries(h265_node
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
   ${GST_LIBRARIES}
+  avcodec
+  avformat
+  swscale
+  avutil
 )
 # --- 新增：IMU 节点配置 ---
 add_executable(imu_node src/imu_node.cpp)

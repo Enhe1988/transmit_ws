@@ -4,118 +4,216 @@
 #include <sensor_msgs/image_encodings.h>
 #include <opencv2/opencv.hpp>
 
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
+// 引入 FFmpeg 的 C 语言头文件
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
+}
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cstring>
+#include <thread>
 
 image_transport::Publisher pub;
-double g_time_offset_sec = 0.0; // 相机时间补偿量（秒），正值表示时间戳往前拨
 
-// --- PTS 时间锚点（与 IMU 锚点机制对称）---
-static bool      time_initialized  = false;
-static ros::Time base_ros_time;
-static GstClockTime base_pts_ns = 0;
+// FFmpeg 全局变量
+const AVCodec *codec = nullptr;
+AVCodecContext *codec_ctx = nullptr;
+AVCodecParserContext *parser = nullptr;
+AVPacket *pkt = nullptr;
+AVFrame *frame = nullptr;
+SwsContext *sws_ctx = nullptr;
 
-GstFlowReturn new_sample(GstAppSink *appsink, gpointer user_data)
+// --- 时间锚点（从 IMU 节点通过参数服务器共享）---
+static bool      anchor_initialized = false;
+static ros::Time anchor_ros_time;
+static uint64_t  anchor_sky_us = 0;
+
+// --- 当前帧的天空端硬件时间戳（从 "aaaa" 包头提取）---
+static uint64_t  current_frame_sky_us = 0;
+static bool      current_frame_has_ts = false;
+
+// ==========================================================
+// 核心解码与发布函数
+// ==========================================================
+void decode_and_publish()
 {
-    GstSample *sample = gst_app_sink_pull_sample(appsink);
-    if (!sample)
-        return GST_FLOW_ERROR;
+    int ret = avcodec_send_packet(codec_ctx, pkt);
+    if (ret < 0) return;
 
-    // 动态获取解码器输出的真实尺寸，防止绿屏和内存崩溃
-    GstCaps *caps = gst_sample_get_caps(sample);
-    GstStructure *structure = gst_caps_get_structure(caps, 0);
-    gint width, height;
-    gst_structure_get_int(structure, "width", &width);
-    gst_structure_get_int(structure, "height", &height);
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(codec_ctx, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return;
+        else if (ret < 0) return;
 
-    GstBuffer *buffer = gst_sample_get_buffer(sample);
+        cv::Mat bgr_mat(frame->height, frame->width, CV_8UC3);
 
-    // 获取 GStreamer buffer 的 PTS（纳秒）
-    GstClockTime pts = GST_BUFFER_PTS(buffer);
-
-    GstMapInfo map;
-    gst_buffer_map(buffer, &map, GST_MAP_READ);
-
-    cv::Mat frame(height, width, CV_8UC3, (char *)map.data);
-
-    if (!frame.empty() && GST_CLOCK_TIME_IS_VALID(pts))
-    {
-        // 建立锚点：第一帧同时记录 ROS 时间和 PTS
-        if (!time_initialized)
-        {
-            base_ros_time     = ros::Time::now();
-            base_pts_ns       = pts;
-            time_initialized  = true;
-            ROS_INFO(">>> CAMERA TIME ANCHOR SET! PTS-based timestamps active. <<<");
+        if (!sws_ctx) {
+            sws_ctx = sws_getContext(frame->width, frame->height, codec_ctx->pix_fmt,
+                                     frame->width, frame->height, AV_PIX_FMT_BGR24,
+                                     SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
         }
 
-        // 用 PTS 偏移量推算 ROS 时间戳，消除回调调度抖动
-        GstClockTime elapsed_ns = pts - base_pts_ns;
-        uint32_t elapsed_sec  = elapsed_ns / 1000000000ULL;
-        uint32_t elapsed_nsec = elapsed_ns % 1000000000ULL;
-        ros::Time stamp = base_ros_time + ros::Duration(elapsed_sec, elapsed_nsec)
-                          - ros::Duration(g_time_offset_sec);
+        uint8_t *dest[4] = { bgr_mat.data, nullptr, nullptr, nullptr };
+        int dest_linesize[4] = { static_cast<int>(bgr_mat.step[0]), 0, 0, 0 };
+        sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, dest, dest_linesize);
+
+        // --- 时间戳赋值：使用 IMU 锚点 + 硬件时间戳推算 ---
+        ros::Time stamp;
+        if (anchor_initialized && current_frame_has_ts &&
+            current_frame_sky_us >= anchor_sky_us)
+        {
+            uint64_t elapsed_us  = current_frame_sky_us - anchor_sky_us;
+            uint32_t elapsed_sec = elapsed_us / 1000000;
+            uint32_t elapsed_ns  = (elapsed_us % 1000000) * 1000;
+            stamp = anchor_ros_time + ros::Duration(elapsed_sec, elapsed_ns);
+            stamp -= ros::Duration(0.066); // 补偿 H.265 编码流水线延迟（kalibr 两次标定一致）
+        }
+        else
+        {
+            stamp = ros::Time::now();
+        }
+
+        // --- 调试：打印时间戳来源和值 ---
+        ROS_INFO_THROTTLE(1.0, "[CAM] sky_us=%lu  anchor_sky=%lu  ros_stamp=%.6f  hw_sync=%s",
+            current_frame_sky_us, anchor_sky_us, stamp.toSec(),
+            (anchor_initialized && current_frame_has_ts) ? "YES" : "NO");
 
         std_msgs::Header header;
         header.stamp    = stamp;
         header.frame_id = "camera_link";
 
-        sensor_msgs::ImagePtr msg = cv_bridge::CvImage(header, "bgr8", frame).toImageMsg();
+        sensor_msgs::ImagePtr msg = cv_bridge::CvImage(header, "bgr8", bgr_mat).toImageMsg();
         pub.publish(msg);
     }
+}
 
-    gst_buffer_unmap(buffer, &map);
-    gst_sample_unref(sample);
+// ==========================================================
+// UDP 接收与解析线程
+// ==========================================================
+void udp_receiver_thread()
+{
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        ROS_ERROR("Failed to create UDP socket!");
+        return;
+    }
 
-    return GST_FLOW_OK;
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family      = AF_INET;
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+    servaddr.sin_port        = htons(9002);
+
+    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        ROS_ERROR("Failed to bind UDP port 9002!");
+        return;
+    }
+
+    uint8_t buffer[65536];
+    ROS_INFO("UDP thread listening. Hardware timestamp mode ACTIVE......");
+
+    while (ros::ok())
+    {
+        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, nullptr, nullptr);
+        if (n <= 0) continue;
+
+        uint8_t *payload_ptr = buffer;
+        int      payload_len = n;
+
+        // 检测帧头标记 "aaaa"（4字节 0xAA）+ 8字节小端时间戳
+        if (n >= 12 &&
+            buffer[0] == 0xAA && buffer[1] == 0xAA &&
+            buffer[2] == 0xAA && buffer[3] == 0xAA)
+        {
+            // 提取 8 字节小端 uint64_t 时间戳（微秒）
+            uint64_t ts = 0;
+            memcpy(&ts, buffer + 4, 8); // x86 本身小端，直接 memcpy 即可
+            current_frame_sky_us = ts;
+            current_frame_has_ts = true;
+
+            // 尝试从参数服务器获取 IMU 锚点（仅在未初始化时轮询）
+            if (!anchor_initialized) {
+                int    ros_sec, ros_nsec;
+                double sky_us;
+                if (ros::param::get("/time_anchor/ros_sec",  ros_sec)  &&
+                    ros::param::get("/time_anchor/ros_nsec", ros_nsec) &&
+                    ros::param::get("/time_anchor/sky_us",   sky_us))
+                {
+                    anchor_ros_time     = ros::Time(ros_sec, ros_nsec);
+                    anchor_sky_us       = (uint64_t)sky_us;
+                    anchor_initialized  = true;
+                    ROS_INFO(">>> CAMERA: IMU time anchor received! Hardware sync ACTIVE. <<<");
+                }
+            }
+
+            payload_ptr = buffer + 12;
+            payload_len = n - 12;
+        }
+
+        // 将裸流喂给 FFmpeg 解析器
+        while (payload_len > 0) {
+            int consumed = av_parser_parse2(parser, codec_ctx,
+                                            &pkt->data, &pkt->size,
+                                            payload_ptr, payload_len,
+                                            AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            if (consumed < 0) break;
+            payload_ptr += consumed;
+            payload_len -= consumed;
+
+            if (pkt->size > 0) {
+                decode_and_publish();
+            }
+        }
+    }
 }
 
 int main(int argc, char **argv)
 {
     ros::init(argc, argv, "h265_receiver_node");
     ros::NodeHandle nh;
-    ros::NodeHandle private_nh("~");
     image_transport::ImageTransport it(nh);
-
-    double time_offset_ms = 0.0;
-    private_nh.param("time_offset_ms", time_offset_ms, 0.0);
-    g_time_offset_sec = time_offset_ms / 1000.0;
-    ROS_INFO("Camera time offset: %.1f ms", time_offset_ms);
-
     pub = it.advertise("/camera/image_raw", 1);
 
-    gst_init(&argc, &argv);
-
-    std::string pipeline_str =
-        "udpsrc port=9002 ! h265parse ! avdec_h265 ! videoconvert ! "
-        "video/x-raw, format=BGR ! appsink name=mysink";
-
-    GError *error = nullptr;
-    GstElement *pipeline = gst_parse_launch(pipeline_str.c_str(), &error);
-
-    if (error)
-    {
-        ROS_ERROR("GStreamer Pipeline 构建失败: %s", error->message);
+    codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (!codec) {
+        ROS_ERROR("H.265 (HEVC) Decoder not found in FFmpeg!");
         return -1;
     }
 
-    GstElement *appsink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
-    if (!appsink)
-    {
-        ROS_ERROR("Failed to get appsink element from pipeline!");
-        gst_object_unref(pipeline);
+    parser = av_parser_init(codec->id);
+    if (!parser) {
+        ROS_ERROR("Parser not found!");
         return -1;
     }
-    g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, nullptr);
-    g_signal_connect(appsink, "new-sample", G_CALLBACK(new_sample), nullptr);
-    gst_object_unref(appsink);
 
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    ROS_INFO("H.265 Video Node Started! Listening on UDP port 9002...");
+    codec_ctx = avcodec_alloc_context3(codec);
+    codec_ctx->flags      |= AV_CODEC_FLAG_LOW_DELAY;
+    codec_ctx->thread_type = FF_THREAD_SLICE;
+
+    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+        ROS_ERROR("Could not open codec!");
+        return -1;
+    }
+
+    pkt   = av_packet_alloc();
+    frame = av_frame_alloc();
+
+    ROS_INFO("FFmpeg Decoder initialized. Waiting for IMU time anchor...");
+
+    std::thread udp_thread(udp_receiver_thread);
 
     ros::spin();
 
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(pipeline);
+    av_parser_close(parser);
+    avcodec_free_context(&codec_ctx);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    if (sws_ctx) sws_freeContext(sws_ctx);
+    udp_thread.join();
+
     return 0;
 }
